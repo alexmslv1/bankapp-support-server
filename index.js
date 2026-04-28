@@ -11,14 +11,13 @@ const db = admin.firestore();
 // Telegram bot
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 let supportChatId = process.env.SUPPORT_CHAT_ID || null;
-const serverStartTime = Date.now();
 
 // ── Telegram → App ──────────────────────────────────────────────
 bot.onText(/\/start/, (msg) => {
   supportChatId = msg.chat.id.toString();
-  console.log('Support connected, chat ID:', supportChatId);
+  console.log('Support connected:', supportChatId);
   bot.sendMessage(supportChatId,
-    '✅ Вы подключены как поддержка.\n\nСообщения от пользователей будут приходить сюда. Отвечайте через Reply (кнопка ответить) на сообщение.'
+    '✅ Вы подключены как поддержка.\n\nСообщения от пользователей будут приходить сюда. Отвечайте через кнопку Reply.'
   );
 });
 
@@ -26,44 +25,65 @@ bot.on('message', async (msg) => {
   if (!msg.text || msg.text.startsWith('/')) return;
   if (!supportChatId) supportChatId = msg.chat.id.toString();
 
+  // Clean up forwarded prefix if support replies to a forwarded message
+  let replyToText = null;
+  if (msg.reply_to_message?.text) {
+    replyToText = msg.reply_to_message.text
+      .replace(/^💬 \*Пользователь:\*\n/, '')
+      .replace(/^💬 Пользователь:\n/, '');
+  }
+
   await db.collection('messages').add({
     text: msg.text,
     isFromUser: false,
-    replyToText: msg.reply_to_message?.text?.replace(/^💬 \*Пользователь:\*\n/, '') || null,
-    createdAt: Date.now()
+    replyToText: replyToText,
+    createdAt: Date.now(),
+    forwarded: true
   });
-  console.log('Support → App:', msg.text);
+  console.log('Telegram → App:', msg.text);
 });
 
 // ── App → Telegram ──────────────────────────────────────────────
-// Слушаем ВСЕ новые документы — фильтруем в JS, без составного индекса
-db.collection('messages').onSnapshot(snapshot => {
-  snapshot.docChanges().forEach(change => {
-    if (change.type !== 'added') return;
-    const data = change.doc.data();
+// Слушаем только сообщения от пользователя которые ещё не переслали
+db.collection('messages')
+  .where('isFromUser', '==', true)
+  .where('forwarded', '==', false)
+  .onSnapshot(async snapshot => {
+    for (const change of snapshot.docChanges()) {
+      if (change.type !== 'added') continue;
 
-    // только сообщения от пользователя, только новые (после старта сервера)
-    if (!data.isFromUser) return;
-    if (!data.createdAt || data.createdAt < serverStartTime) return;
+      const data = change.doc.data();
+      console.log('New user message:', data.text);
 
-    if (!supportChatId) {
-      console.log('Нет supportChatId — поддержка должна написать /start боту');
-      return;
+      // Сразу помечаем как пересланное чтобы не отправить дважды
+      await change.doc.ref.update({ forwarded: true });
+
+      if (!supportChatId) {
+        console.log('No supportChatId — support must /start the bot');
+        continue;
+      }
+
+      let text = `💬 Пользователь:\n${data.text}`;
+      if (data.replyToText) {
+        text = `↩️ В ответ на: "${data.replyToText}"\n\n` + text;
+      }
+
+      await bot.sendMessage(supportChatId, text);
+      console.log('App → Telegram: forwarded ✅');
     }
-
-    let text = `💬 *Пользователь:*\n${data.text}`;
-    if (data.replyToText) {
-      text = `↩️ _В ответ на:_ "${data.replyToText}"\n\n` + text;
-    }
-
-    bot.sendMessage(supportChatId, text, { parse_mode: 'Markdown' });
-    console.log('App → Telegram:', data.text);
   });
-});
 
-// ── Health check ────────────────────────────────────────────────
+// ── Express ─────────────────────────────────────────────────────
 const app = express();
-app.get('/', (_, res) => res.send('BankApp support server is running ✅'));
-app.listen(process.env.PORT || 3000, () =>
-  console.log('Server started, port', process.env.PORT || 3000)
-);
+app.get('/', (_, res) => res.send('BankApp support server ✅'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Server running on port', PORT));
+
+// Пинг себя каждые 14 минут чтобы Render не засыпал
+const RENDER_URL = process.env.RENDER_URL;
+if (RENDER_URL) {
+  setInterval(() => {
+    require('https').get(RENDER_URL, () => console.log('Self-ping ✅'))
+      .on('error', e => console.log('Ping error:', e.message));
+  }, 14 * 60 * 1000);
+}
