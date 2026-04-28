@@ -5,80 +5,65 @@ const admin = require('firebase-admin');
 
 // Firebase init
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 // Telegram bot
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
-
-// Telegram chat ID of support (filled after first /start)
 let supportChatId = process.env.SUPPORT_CHAT_ID || null;
+const serverStartTime = Date.now();
 
 // ── Telegram → App ──────────────────────────────────────────────
 bot.onText(/\/start/, (msg) => {
   supportChatId = msg.chat.id.toString();
-  console.log('Support chat ID:', supportChatId);
+  console.log('Support connected, chat ID:', supportChatId);
   bot.sendMessage(supportChatId,
-    '✅ Вы подключены как поддержка.\n\nВсе сообщения от пользователей будут приходить сюда. Просто отвечайте на них.'
+    '✅ Вы подключены как поддержка.\n\nСообщения от пользователей будут приходить сюда. Отвечайте через Reply (кнопка ответить) на сообщение.'
   );
 });
 
-// Support replies in Telegram → save to Firestore → app gets update
 bot.on('message', async (msg) => {
-  if (msg.text?.startsWith('/')) return;
-
-  const chatId = msg.chat.id.toString();
-  if (!supportChatId) supportChatId = chatId;
-
-  let replyToText = null;
-  if (msg.reply_to_message?.text) {
-    replyToText = msg.reply_to_message.text;
-  }
+  if (!msg.text || msg.text.startsWith('/')) return;
+  if (!supportChatId) supportChatId = msg.chat.id.toString();
 
   await db.collection('messages').add({
     text: msg.text,
     isFromUser: false,
-    replyToText: replyToText,
-    date: admin.firestore.FieldValue.serverTimestamp(),
+    replyToText: msg.reply_to_message?.text?.replace(/^💬 \*Пользователь:\*\n/, '') || null,
     createdAt: Date.now()
   });
-
-  console.log('Support message saved:', msg.text);
+  console.log('Support → App:', msg.text);
 });
 
 // ── App → Telegram ──────────────────────────────────────────────
-// Listen for new user messages in Firestore and forward to Telegram
-db.collection('messages')
-  .where('isFromUser', '==', true)
-  .orderBy('createdAt', 'desc')
-  .limit(1)
-  .onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(change => {
-      if (change.type === 'added') {
-        const data = change.doc.data();
-        // Skip old messages on startup
-        if (!data.createdAt || Date.now() - data.createdAt > 5000) return;
+// Слушаем ВСЕ новые документы — фильтруем в JS, без составного индекса
+db.collection('messages').onSnapshot(snapshot => {
+  snapshot.docChanges().forEach(change => {
+    if (change.type !== 'added') return;
+    const data = change.doc.data();
 
-        if (!supportChatId) {
-          console.log('No support chat ID yet. Support must /start the bot first.');
-          return;
-        }
+    // только сообщения от пользователя, только новые (после старта сервера)
+    if (!data.isFromUser) return;
+    if (!data.createdAt || data.createdAt < serverStartTime) return;
 
-        let text = `💬 *Пользователь:*\n${data.text}`;
-        if (data.replyToText) {
-          text = `↩️ _Ответ на:_ "${data.replyToText}"\n\n` + text;
-        }
+    if (!supportChatId) {
+      console.log('Нет supportChatId — поддержка должна написать /start боту');
+      return;
+    }
 
-        bot.sendMessage(supportChatId, text, { parse_mode: 'Markdown' });
-      }
-    });
+    let text = `💬 *Пользователь:*\n${data.text}`;
+    if (data.replyToText) {
+      text = `↩️ _В ответ на:_ "${data.replyToText}"\n\n` + text;
+    }
+
+    bot.sendMessage(supportChatId, text, { parse_mode: 'Markdown' });
+    console.log('App → Telegram:', data.text);
   });
-
-// ── Express health check ────────────────────────────────────────
-const app = express();
-app.get('/', (req, res) => res.send('BankApp support server is running'));
-app.listen(process.env.PORT || 3000, () => {
-  console.log('Server started on port', process.env.PORT || 3000);
 });
+
+// ── Health check ────────────────────────────────────────────────
+const app = express();
+app.get('/', (_, res) => res.send('BankApp support server is running ✅'));
+app.listen(process.env.PORT || 3000, () =>
+  console.log('Server started, port', process.env.PORT || 3000)
+);
