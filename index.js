@@ -12,12 +12,15 @@ const db = admin.firestore();
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 let supportChatId = process.env.SUPPORT_CHAT_ID || null;
 
+// IDs уже пересланных сообщений — чтобы не дублировать при рестарте
+const forwarded = new Set();
+
 // ── Telegram → App ──────────────────────────────────────────────
 bot.onText(/\/start/, (msg) => {
   supportChatId = msg.chat.id.toString();
   console.log('Support connected:', supportChatId);
   bot.sendMessage(supportChatId,
-    '✅ Вы подключены как поддержка.\n\nСообщения от пользователей будут приходить сюда. Отвечайте через кнопку Reply.'
+    '✅ Вы подключены как поддержка.\nСообщения от пользователей будут приходить сюда. Отвечайте через Reply.'
   );
 });
 
@@ -25,61 +28,61 @@ bot.on('message', async (msg) => {
   if (!msg.text || msg.text.startsWith('/')) return;
   if (!supportChatId) supportChatId = msg.chat.id.toString();
 
-  // Clean up forwarded prefix if support replies to a forwarded message
   let replyToText = null;
   if (msg.reply_to_message?.text) {
-    replyToText = msg.reply_to_message.text
-      .replace(/^💬 \*Пользователь:\*\n/, '')
-      .replace(/^💬 Пользователь:\n/, '');
+    replyToText = msg.reply_to_message.text.replace(/^💬 Пользователь:\n/, '');
   }
 
   await db.collection('messages').add({
     text: msg.text,
     isFromUser: false,
     replyToText: replyToText,
-    createdAt: Date.now(),
-    forwarded: true
+    createdAt: Date.now()
   });
   console.log('Telegram → App:', msg.text);
 });
 
 // ── App → Telegram ──────────────────────────────────────────────
-// Слушаем только сообщения от пользователя которые ещё не переслали
+// Без where-фильтров — никаких индексов не нужно, фильтруем в JS
 db.collection('messages')
-  .where('isFromUser', '==', true)
-  .where('forwarded', '==', false)
-  .onSnapshot(async snapshot => {
-    for (const change of snapshot.docChanges()) {
-      if (change.type !== 'added') continue;
+  .orderBy('createdAt', 'desc')
+  .limit(50)
+  .onSnapshot(snapshot => {
+    snapshot.docChanges().forEach(async change => {
+      if (change.type !== 'added') return;
 
-      const data = change.doc.data();
+      const docId = change.doc.id;
+      const data  = change.doc.data();
+
+      // Только сообщения от пользователя, которые ещё не пересылали
+      if (!data.isFromUser)       return;
+      if (forwarded.has(docId))   return;
+      forwarded.add(docId);
+
+      // Пропускаем старые сообщения (старше 30 секунд)
+      if (data.createdAt && Date.now() - data.createdAt > 30_000) return;
+
       console.log('New user message:', data.text);
 
-      // Сразу помечаем как пересланное чтобы не отправить дважды
-      await change.doc.ref.update({ forwarded: true });
-
       if (!supportChatId) {
-        console.log('No supportChatId — support must /start the bot');
-        continue;
+        console.log('No supportChatId — support must send /start to the bot');
+        return;
       }
 
       let text = `💬 Пользователь:\n${data.text}`;
-      if (data.replyToText) {
-        text = `↩️ В ответ на: "${data.replyToText}"\n\n` + text;
-      }
+      if (data.replyToText) text = `↩️ В ответ на: "${data.replyToText}"\n\n` + text;
 
       await bot.sendMessage(supportChatId, text);
-      console.log('App → Telegram: forwarded ✅');
-    }
+      console.log('Forwarded to Telegram ✅');
+    });
   });
 
-// ── Express ─────────────────────────────────────────────────────
+// ── Express + self-ping ─────────────────────────────────────────
 const app = express();
 app.get('/', (_, res) => res.send('BankApp support server ✅'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server running on port', PORT));
 
-// Пинг себя каждые 14 минут чтобы Render не засыпал
 const RENDER_URL = process.env.RENDER_URL;
 if (RENDER_URL) {
   setInterval(() => {
